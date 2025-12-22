@@ -376,17 +376,32 @@ def fuse_fx(gm: torch.fx.GraphModule, example_inputs) -> torch.fx.GraphModule:
     is_cpu = is_cpu_device(example_inputs)
     # pyre-fixme[16]: Module `torch._dynamo.utils` has no attribute `detect_fake_mode`
     fake_mode = detect_fake_mode(example_inputs)
-
+    
+    # From: cat -> [Optional]view -> pointwise(relu) 
+    # To: some_pointwise(relu) -> view -> cat
     gm = sink_cat_after_pointwise(gm)
     if config.permute_fusion and not is_cpu:
         # For linear permute fusion, we need to check input info to identify
         # and perform proper permutation/transpose
         ShapeProp(gm, fake_mode=fake_mode).propagate(*example_inputs)
+            # monitor and record the changes of the graph
+            # provenace tracing by recording the "from node" of the changed node
+            # good for compile debug
         with GraphTransformObserver(gm, "linear_permute_fusion"):
+            # Y = (WX + b)^T  => Y = X^T W^T + b^T
             gm = linear_permute_fusion(gm)
         with GraphTransformObserver(gm, "permute_linear_fusion"):
+            # X1 = X.permute(0, 2, 1)
+            # Y1 = X1 * W1^T + bias1
+            # Y1 = Linear(input.permute(...), weight)
+            # ---->
+            # Y2 = X1.transpose(-1, -2) * W1^T + bias1
+            # Y2 = matmul(input.trans(), W1.t()) + b
             gm = permute_linear_fusion(gm)
         with GraphTransformObserver(gm, "permute_matmul_fusion"):
+            # matmul(A.permute(), B)
+            # ====>
+            # matmul(A.transpose(), B)
             gm = permute_matmul_fusion(gm)
 
     # make sure the autograd is disabled.
@@ -394,8 +409,10 @@ def fuse_fx(gm: torch.fx.GraphModule, example_inputs) -> torch.fx.GraphModule:
         return gm
     if config.freezing:
         with GraphTransformObserver(gm, "remove_identity"):
+            # remove nn.Indentity
             gm = remove_identity(gm)
         with GraphTransformObserver(gm, "fuse_conv_bn"):
+            # fuse conv + bn => conv
             gm = fuse_conv_bn(gm)
     return gm
 
@@ -482,6 +499,7 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
         conv_bn_to_fuse.clear()
         for node in gm.graph.nodes:
             if matches_module_pattern(pattern, node, modules):
+                # the conv is used by other node
                 if len(node.args[0].users) > 1:  # Output of conv is used by other nodes
                     continue
                 conv = modules[node.args[0].target]
@@ -491,7 +509,10 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
                     continue
                 if not bn.track_running_stats:
                     continue
-
+                
+                # !!!: "Node" represents an operation.
+                #      "Module" represents an object
+                # an object may perform multiple operations in the forward pass
                 # Do hash based on the module name of conv
                 hash_id = hash(node.args[0].target)
                 if hash_id not in conv_bn_to_fuse:
@@ -501,6 +522,7 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
                         # Do fusion if same bn module
                         conv_bn_to_fuse[hash_id].add_bn_node(node)
                     else:
+                        # the conv is used by other bn(different id)
                         # Disable the conv bn folding if conv shared by different bn
                         conv_bn_to_fuse[hash_id].disable_fusion()
 
@@ -680,6 +702,7 @@ def check_permute(node: torch.fx.Node) -> bool:
 
 
 def sink_cat_after_pointwise(module: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # cat -> relu  => relu -> cat
     def one_user(node):
         users = list(node.users)
         return users[0] if len(users) == 1 else None
@@ -703,21 +726,27 @@ def sink_cat_after_pointwise(module: torch.fx.GraphModule) -> torch.fx.GraphModu
             if not user or not is_view(user):
                 break
             cat_or_view = user
-
+        # 此时user必须指向node的下一个非view非空操作。
+        # cat_or_view是users的上一个操作
         if user and is_pointwise_unary(user):
+            # 所有的create_node会自动插入node之前
+            # cat(node) -> [optional]view(cat_or_view) -> relu(user)
             with g.inserting_before(node):
 
                 def cat_args(tensors, dim=0):
                     return tensors, dim
-
+                # 魔法方法提取cat(node)的输入参数
                 tensors, dim = cat_args(*node.args, **node.kwargs)
+                # 提取relu的key word，一般是配置信息
                 new_kwargs = {
                     name: val for name, val in user.kwargs.items() if name != "input"
                 }
+                # some_new_relu -> cat(node) -> [optional]view(cat_or_view) -> relu(user)
                 new_tensors = [
                     g.create_node(user.op, user.target, args=(arg,), kwargs=new_kwargs)
                     for arg in tensors
                 ]
+                # some_new_relu -> new_cat -> cat(node) -> [optional]view(cat_or_view) -> relu(user)
                 new_cat = g.create_node(
                     "call_function", torch.cat, args=(new_tensors, dim)
                 )
@@ -725,6 +754,7 @@ def sink_cat_after_pointwise(module: torch.fx.GraphModule) -> torch.fx.GraphModu
                 node.replace_all_uses_with(new_cat)
                 g.erase_node(user)
                 g.erase_node(node)
+                # some_new_relu -> new_cat -> [optional]view(cat_or_view)
     g.lint()
     module.recompile()
     return module
