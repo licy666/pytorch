@@ -1,7 +1,13 @@
 # Owner(s): ["module: PrivateUse1"]
 
+import os
+
 import torch
 from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, TestCase
+
+
+# Enable deterministic test-only helpers exposed by torch_openreg._C.
+os.environ.setdefault("TORCH_OPENREG_ENABLE_TEST_APIS", "1")
 
 
 class TestStream(TestCase):
@@ -154,6 +160,59 @@ class TestStream(TestCase):
         self.assertEqual(event.device.type, "openreg")
         stream.synchronize()
         self.assertTrue(event.query())
+
+
+class TestOpenRegAsyncHelper(TestCase):
+    @skipIfTorchDynamo()
+    def test_event_not_ready_until_stream_sync(self):
+        # This test is intentionally deterministic: it does not rely on
+        # wall-clock sleeps. Instead, we enqueue a blocking task onto the stream
+        # and confirm that an event recorded *after* that task is not ready
+        # until the stream is explicitly synchronized.
+        import torch_openreg._C  # type: ignore[import-not-found]
+
+        torch.openreg.init()
+
+        stream = torch.Stream(device="openreg:0")
+        gate = torch_openreg._C._test_create_blocking_gate()
+        released = False
+        try:
+            torch_openreg._C._test_enqueue_wait_for_gate(stream, gate)
+
+            event = torch.Event(device="openreg:0")
+            event.record(stream)
+            self.assertFalse(event.query())
+
+            torch_openreg._C._test_release_blocking_gate(gate)
+            released = True
+            stream.synchronize()
+            self.assertTrue(event.query())
+        finally:
+            # Best-effort cleanup to avoid leaving a blocked stream worker
+            # thread if the test fails mid-way.
+            if not released:
+                torch_openreg._C._test_release_blocking_gate(gate)
+
+
+class TestOpenRegGuardRecordDataPtrOnStream(TestCase):
+    @skipIfTorchDynamo()
+    def test_record_data_ptr_on_stream_forwards_to_allocator(self):
+        # This is a smoke test for the PrivateUse1 guard hook
+        # DeviceGuardImplInterface::recordDataPtrOnStream.
+        #
+        # CUDA/XPU override this hook to forward to their caching allocators.
+        # OpenReg should do the same so stream recording is exercised by core
+        # call sites.
+        import torch_openreg._C  # type: ignore[import-not-found]
+
+        torch.openreg.init()
+
+        torch_openreg._C._test_reset_record_stream_calls()
+        x = torch.ones(8, 8, device="openreg:0")
+        s = torch.Stream(device="openreg:0")
+
+        torch_openreg._C._test_record_data_ptr_on_stream(x, s)
+        self.assertGreater(torch_openreg._C._test_get_record_stream_calls(), 0)
 
 
 if __name__ == "__main__":
