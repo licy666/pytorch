@@ -1,5 +1,6 @@
 #include "OpenRegDeviceAllocator.h"
 #include "OpenRegFunctions.h"
+#include "OpenRegTestAllocator.h"
 
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
@@ -338,6 +339,13 @@ void OpenRegDeviceAllocator::emptyCache(MempoolId_t mempool_id) {
 void OpenRegDeviceAllocator::recordStream(
     const DataPtr& ptr,
     c10::Stream stream) {
+  // PR2-level plumbing: this counter is used by tests to ensure the PrivateUse1
+  // guard hook forwards recordDataPtrOnStream() to the allocator's recordStream().
+  // Stream-aware lifetime semantics are implemented in a follow-up PR.
+  (void)ptr;
+  (void)stream;
+  testBumpRecordStreamCallCount();
+
   // OpenReg doesn't track stream usage yet
   // TODO: When stream support is added, track which streams are using this pointer
 }

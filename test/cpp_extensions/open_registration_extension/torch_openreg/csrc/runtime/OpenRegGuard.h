@@ -2,6 +2,7 @@
 
 #include <c10/core/Device.h>
 #include <c10/core/DeviceCapability.h>
+#include <c10/core/CachingDeviceAllocator.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 
 #include <include/openreg.h>
@@ -92,6 +93,18 @@ struct OpenRegGuardImpl final : public c10::impl::DeviceGuardImplInterface {
     OPENREG_CHECK(orDeviceSynchronize());
   }
   // LITERALINCLUDE END: OPENREG ALL DEVICE GUARD IMPL
+
+  void recordDataPtrOnStream(
+      const c10::DataPtr& data_ptr,
+      const Stream& stream) const override {
+    // Match CUDA/XPU behavior: forward to the backend allocator so it can
+    // establish stream dependencies for safe reuse of cached allocations.
+    //
+    // Note: Core call sites already guard against cross-device usage; if the
+    // DataPtr is not owned by OpenReg's device allocator, the allocator-side
+    // implementation is expected to ignore it.
+    c10::getDeviceAllocator(static_type)->recordStream(data_ptr, stream);
+  }
 
   // LITERALINCLUDE START: OPENREG ALL STREAM GUARD IMPL
   /**
