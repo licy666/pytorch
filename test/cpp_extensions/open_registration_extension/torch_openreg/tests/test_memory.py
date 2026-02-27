@@ -1,9 +1,14 @@
 # Owner(s): ["module: PrivateUse1"]
 
 import gc
+import os
 import time
 
 import torch
+
+
+# Enable deterministic test-only helpers exposed by torch_openreg._C.
+os.environ.setdefault("TORCH_OPENREG_ENABLE_TEST_APIS", "1")
 import torch_openreg  # noqa: F401
 from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, TestCase
 
@@ -217,6 +222,136 @@ class TestDeviceAllocator(TestCase):
         # Modifying one should affect the other
         x.fill_(5.0)
         self.assertTrue(torch.all(y == 5.0))
+
+
+class TestStreamAwareDeviceMemory(TestCase):
+    @skipIfTorchDynamo()
+    def test_deferred_reuse_until_stream_completes(self):
+        import torch_openreg._C  # type: ignore[import-not-found]
+
+        torch.openreg.init()
+        torch.accelerator.empty_cache()
+
+        alloc_stream = torch.Stream(device="openreg:0")
+        use_stream = torch.Stream(device="openreg:0")
+        gate = torch_openreg._C._test_create_blocking_gate()
+        released = False
+        try:
+            # Make the stream deterministically "busy" so an event recorded onto
+            # it will not complete until we release the gate.
+            torch_openreg._C._test_enqueue_wait_for_gate(use_stream, gate)
+
+            # Use a "large-ish" unique size (in bytes) to avoid interacting with
+            # other allocator cache state within this file's test suite.
+            nbytes = 1234567
+
+            with alloc_stream:
+                x = torch.empty(nbytes, device="openreg:0", dtype=torch.uint8)
+            ptr_x = x.data_ptr()
+
+            # Inform the backend allocator that x's storage is used on `use_stream`.
+            torch_openreg._C._test_record_data_ptr_on_stream(x, use_stream)
+
+            # Free x while `use_stream` is still blocked. A stream-aware allocator
+            # must not recycle ptr_x into the cache yet.
+            del x
+            gc.collect()
+
+            with alloc_stream:
+                y = torch.empty(nbytes, device="openreg:0", dtype=torch.uint8)
+            self.assertNotEqual(y.data_ptr(), ptr_x)
+
+            # Once the stream completes, the deferred block should become
+            # eligible for reuse.
+            torch_openreg._C._test_release_blocking_gate(gate)
+            released = True
+            use_stream.synchronize()
+
+            # After the stream completes, ptr_x should be eligible for reuse.
+            # We don't require it to be returned on the *very next* allocation
+            # for all allocator policies; but with a clean cache and a same-stream
+            # allocation, it's expected to be available.
+            with alloc_stream:
+                z = torch.empty(nbytes, device="openreg:0", dtype=torch.uint8)
+            if z.data_ptr() != ptr_x:
+                # Bound the search to keep the test deterministic.
+                seen = {z.data_ptr()}
+                for _ in range(10):
+                    with alloc_stream:
+                        t = torch.empty(nbytes, device="openreg:0", dtype=torch.uint8)
+                    seen.add(t.data_ptr())
+                    if t.data_ptr() == ptr_x:
+                        break
+                self.assertIn(ptr_x, seen)
+        finally:
+            if not released:
+                torch_openreg._C._test_release_blocking_gate(gate)
+
+    @skipIfTorchDynamo()
+    def test_deferred_reuse_waits_for_all_recorded_streams(self):
+        import torch_openreg._C  # type: ignore[import-not-found]
+
+        torch.openreg.init()
+        torch.accelerator.empty_cache()
+
+        alloc_stream = torch.Stream(device="openreg:0")
+        s1 = torch.Stream(device="openreg:0")
+        s2 = torch.Stream(device="openreg:0")
+        gate1 = torch_openreg._C._test_create_blocking_gate()
+        gate2 = torch_openreg._C._test_create_blocking_gate()
+        released1 = False
+        released2 = False
+        try:
+            torch_openreg._C._test_enqueue_wait_for_gate(s1, gate1)
+            torch_openreg._C._test_enqueue_wait_for_gate(s2, gate2)
+
+            nbytes = 1234567
+
+            with alloc_stream:
+                x = torch.empty(nbytes, device="openreg:0", dtype=torch.uint8)
+            ptr_x = x.data_ptr()
+
+            # Record usage on both streams; free must be deferred until both
+            # streams complete.
+            torch_openreg._C._test_record_data_ptr_on_stream(x, s1)
+            torch_openreg._C._test_record_data_ptr_on_stream(x, s2)
+
+            del x
+            gc.collect()
+
+            with alloc_stream:
+                y = torch.empty(nbytes, device="openreg:0", dtype=torch.uint8)
+            self.assertNotEqual(y.data_ptr(), ptr_x)
+
+            torch_openreg._C._test_release_blocking_gate(gate1)
+            released1 = True
+            s1.synchronize()
+
+            with alloc_stream:
+                z = torch.empty(nbytes, device="openreg:0", dtype=torch.uint8)
+            self.assertNotEqual(z.data_ptr(), ptr_x)
+
+            torch_openreg._C._test_release_blocking_gate(gate2)
+            released2 = True
+            s2.synchronize()
+
+            with alloc_stream:
+                w = torch.empty(nbytes, device="openreg:0", dtype=torch.uint8)
+            if w.data_ptr() != ptr_x:
+                # See comment in test_deferred_reuse_until_stream_completes.
+                seen = {w.data_ptr()}
+                for _ in range(10):
+                    with alloc_stream:
+                        t = torch.empty(nbytes, device="openreg:0", dtype=torch.uint8)
+                    seen.add(t.data_ptr())
+                    if t.data_ptr() == ptr_x:
+                        break
+                self.assertIn(ptr_x, seen)
+        finally:
+            if not released1:
+                torch_openreg._C._test_release_blocking_gate(gate1)
+            if not released2:
+                torch_openreg._C._test_release_blocking_gate(gate2)
 
 
 class TestMemoryLeaks(TestCase):

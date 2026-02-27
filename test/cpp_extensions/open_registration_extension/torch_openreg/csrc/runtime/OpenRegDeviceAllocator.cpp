@@ -1,9 +1,13 @@
 #include "OpenRegDeviceAllocator.h"
 #include "OpenRegFunctions.h"
+#include "OpenRegStream.h"
 #include "OpenRegTestAllocator.h"
 
+#include <c10/core/DeviceGuard.h>
 #include <c10/util/Exception.h>
+#include <c10/util/ScopeExit.h>
 #include <c10/util/irange.h>
+#include <c10/util/safe_numerics.h>
 
 #include <unistd.h>
 
@@ -27,7 +31,25 @@ size_t getPageSizeBytes() {
 
 size_t roundUpToPageSize(size_t nbytes) {
   const size_t page_size = getPageSizeBytes();
-  return ((nbytes + page_size - 1) / page_size) * page_size;
+  // Overflow-safe version of: ((nbytes + page_size - 1) / page_size) * page_size
+  // Fail closed: if rounding overflows, refuse the allocation.
+  TORCH_INTERNAL_ASSERT(page_size != 0);
+  size_t rounded_up_dividend = 0;
+  TORCH_CHECK(
+      !c10::add_overflows(nbytes, page_size - 1, &rounded_up_dividend),
+      "OpenReg allocator size overflow while aligning ",
+      nbytes,
+      " bytes to page size ",
+      page_size);
+  const size_t num_pages = rounded_up_dividend / page_size;
+  size_t aligned_nbytes = 0;
+  TORCH_CHECK(
+      !c10::mul_overflows(num_pages, page_size, &aligned_nbytes),
+      "OpenReg allocator size overflow while aligning ",
+      nbytes,
+      " bytes to page size ",
+      page_size);
+  return aligned_nbytes;
 }
 
 } // namespace
@@ -43,20 +65,60 @@ void* DeviceMemoryAllocator::malloc(size_t nbytes) {
 
   std::lock_guard<std::recursive_mutex> lock(mutex_);
 
+  const auto alloc_stream = getCurrentOpenRegStream(device_index_).unwrap();
+  const StreamKey stream_key = alloc_stream;
+
   // OpenReg aligns device allocations to page size internally.
   const size_t aligned_nbytes = roundUpToPageSize(nbytes);
 
-  // Single-level cache: pick the smallest cached block
-  auto cached_it = cached_blocks_.lower_bound(aligned_nbytes);
-  if (cached_it != cached_blocks_.end()) {
+  auto tryReuseFromCacheNoLock = [&](StreamKey key) -> void* {
+    auto cache_it = cached_blocks_by_stream_.find(key);
+    if (cache_it == cached_blocks_by_stream_.end()) {
+      return nullptr;
+    }
+
+    auto& cache = cache_it->second;
+    auto cached_it = cache.lower_bound(aligned_nbytes);
+    if (cached_it == cache.end()) {
+      return nullptr;
+    }
+
     const size_t cached_nbytes = cached_it->first;
     void* data = cached_it->second;
-    cached_blocks_.erase(cached_it);
-    cached_pointers_.erase(data);
+    cache.erase(cached_it);
+    if (cache.empty()) {
+      cached_blocks_by_stream_.erase(cache_it);
+    }
 
-    allocation_sizes_[data] = cached_nbytes;
+    auto it = blocks_.find(data);
+    TORCH_INTERNAL_ASSERT(
+        it != blocks_.end(),
+        "OpenReg allocator missing metadata for cached pointer ",
+        data);
+    auto& block = it->second;
+    block.size_bytes = cached_nbytes;
+    block.alloc_stream = alloc_stream;
+    block.stream_uses.clear();
+    block.events.clear();
+    block.state = BlockState::Allocated;
+
     stats_.allocated_bytes[kAggregate].increase(cached_nbytes);
     return data;
+  };
+
+  // Fast path: reuse from the current stream's cache.
+  if (void* data = tryReuseFromCacheNoLock(stream_key)) {
+    return data;
+  }
+
+  // Avoid scanning deferred blocks on every allocation. Only process deferred
+  // blocks when we miss the cache (and only if there is work to do), then
+  // retry the current stream's cache.
+  if (!deferred_pointers_.empty()) {
+    processDeferredBlocksNoLock();
+    if (void* data = tryReuseFromCacheNoLock(stream_key)) {
+      return data;
+    }
   }
 
   void* data = nullptr;
@@ -76,8 +138,7 @@ void* DeviceMemoryAllocator::malloc(size_t nbytes) {
       stats_.reserved_bytes[kAggregate].current,
       " bytes");
 
-  // Track allocation size for proper deallocation statistics
-  allocation_sizes_[data] = aligned_nbytes;
+  blocks_.emplace(data, BlockInfo(aligned_nbytes, alloc_stream));
 
   // Update statistics
   stats_.allocated_bytes[kAggregate].increase(aligned_nbytes);
@@ -94,26 +155,77 @@ void DeviceMemoryAllocator::free(void* ptr) {
 
   std::lock_guard<std::recursive_mutex> lock(mutex_);
 
-  auto it = allocation_sizes_.find(ptr);
-  if (it != allocation_sizes_.end()) {
-    const size_t nbytes = it->second;
-    allocation_sizes_.erase(it);
+  auto it = blocks_.find(ptr);
+  if (it != blocks_.end()) {
+    auto& block = it->second;
+    if (block.state == BlockState::Cached) {
+      TORCH_WARN(
+          "Attempted to free an OpenReg memory pointer ",
+          ptr,
+          " on device ",
+          device_index_,
+          " that is already cached. This likely indicates a double-free.");
+      return;
+    }
+    if (block.state == BlockState::Deferred) {
+      TORCH_WARN(
+          "Attempted to free an OpenReg memory pointer ",
+          ptr,
+          " on device ",
+          device_index_,
+          " that is pending deferred reuse. This likely indicates a double-free.");
+      return;
+    }
 
-    stats_.allocated_bytes[kAggregate].decrease(nbytes);
+    if (block.stream_uses.empty()) {
+      stats_.allocated_bytes[kAggregate].decrease(block.size_bytes);
+      moveBlockToCacheNoLock(ptr, block);
+      return;
+    }
 
-    // Cache the block for future reuse.
-    cached_blocks_.emplace(nbytes, ptr);
-    cached_pointers_.insert(ptr);
-    return;
-  }
+    // Defer reuse until all recorded streams complete. We record one event per
+    // stream-use and move the block back to the cache once all events are ready.
+    c10::DeviceGuard device_guard{
+        c10::Device(c10::DeviceType::PrivateUse1, device_index_)};
 
-  if (cached_pointers_.find(ptr) != cached_pointers_.end()) {
-    TORCH_WARN(
-        "Attempted to free an OpenReg memory pointer ",
-        ptr,
-        " on device ",
-        device_index_,
-        " that is already cached. This likely indicates a double-free.");
+    std::vector<orEvent_t> created_events;
+    created_events.reserve(block.stream_uses.size());
+    auto cleanup = c10::make_scope_exit([&]() noexcept {
+      // Best-effort cleanup on exceptional paths. Avoid throwing from a
+      // destructor-like scope guard.
+      for (auto ev : created_events) {
+        if (ev != nullptr) {
+          (void)orEventDestroy(ev);
+        }
+      }
+    });
+
+    for (const auto& use_stream : block.stream_uses) {
+      TORCH_INTERNAL_ASSERT(
+          use_stream.device_type() == c10::DeviceType::PrivateUse1,
+          "OpenReg allocator recorded a non-PrivateUse1 stream unexpectedly");
+      TORCH_CHECK(
+          use_stream.device_index() == device_index_,
+          "recordStream() recorded a stream on device ",
+          use_stream.device_index(),
+          " for an allocation on device ",
+          device_index_,
+          ".");
+
+      orEvent_t ev = nullptr;
+      OPENREG_CHECK(orEventCreate(&ev));
+      OPENREG_CHECK(orEventRecord(ev, OpenRegStream(use_stream)));
+      created_events.push_back(ev);
+    }
+
+    // Transfer ownership to the block now that all events are recorded.
+    block.events = std::move(created_events);
+    cleanup.release();
+
+    stats_.allocated_bytes[kAggregate].decrease(block.size_bytes);
+    block.stream_uses.clear();
+    block.state = BlockState::Deferred;
+    deferred_pointers_.insert(ptr);
     return;
   }
 
@@ -139,33 +251,84 @@ void DeviceMemoryAllocator::free(void* ptr) {
   }
 }
 
+void DeviceMemoryAllocator::recordStream(void* ptr, c10::Stream stream) {
+  if (!ptr) {
+    return;
+  }
+  if (stream.device_type() != c10::DeviceType::PrivateUse1) {
+    // Best-effort: ignore streams that aren't owned by the OpenReg backend.
+    return;
+  }
+
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+  auto it = blocks_.find(ptr);
+  if (it == blocks_.end()) {
+    // Best-effort: ignore pointers not owned by this allocator.
+    return;
+  }
+
+  auto& block = it->second;
+  if (block.state != BlockState::Allocated) {
+    // Only track usage for active allocations. This mirrors how other caching
+    // allocators treat late/invalid recordStream calls.
+    return;
+  }
+
+  TORCH_CHECK(
+      stream.device_index() == device_index_,
+      "recordStream was called with a stream on device ",
+      stream.device_index(),
+      " for an allocation on device ",
+      device_index_,
+      ".");
+
+  if (stream == block.alloc_stream) {
+    return;
+  }
+
+  block.stream_uses.insert(stream);
+}
+
 std::vector<void*> DeviceMemoryAllocator::emptyCache() {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
 
+  processDeferredBlocksNoLock();
+
   std::vector<void*> removed;
-  for (auto it = cached_blocks_.begin(); it != cached_blocks_.end();) {
-    const size_t nbytes = it->first;
-    void* ptr = it->second;
-    const auto ret = orFree(ptr);
+  for (auto cache_it = cached_blocks_by_stream_.begin();
+       cache_it != cached_blocks_by_stream_.end();) {
+    auto& cache = cache_it->second;
+    for (auto it = cache.begin(); it != cache.end();) {
+      const size_t nbytes = it->first;
+      void* ptr = it->second;
+      const auto ret = orFree(ptr);
 
-    if (ret == orSuccess || ret == orErrorUnknown) {
-      stats_.reserved_bytes[kAggregate].decrease(nbytes);
-      if (ret == orSuccess) {
-        stats_.num_device_free++;
+      if (ret == orSuccess || ret == orErrorUnknown) {
+        stats_.reserved_bytes[kAggregate].decrease(nbytes);
+        if (ret == orSuccess) {
+          stats_.num_device_free++;
+        }
+
+        blocks_.erase(ptr);
+        removed.push_back(ptr);
+        it = cache.erase(it);
+      } else {
+        TORCH_WARN(
+            "orFree failed while emptying OpenReg cache for pointer ",
+            ptr,
+            " on device ",
+            device_index_,
+            ". Return code: ",
+            ret);
+        ++it;
       }
+    }
 
-      cached_pointers_.erase(ptr);
-      removed.push_back(ptr);
-      it = cached_blocks_.erase(it);
+    if (cache.empty()) {
+      cache_it = cached_blocks_by_stream_.erase(cache_it);
     } else {
-      TORCH_WARN(
-          "orFree failed while emptying OpenReg cache for pointer ",
-          ptr,
-          " on device ",
-          device_index_,
-          ". Return code: ",
-          ret);
-      ++it;
+      ++cache_it;
     }
   }
   return removed;
@@ -211,6 +374,60 @@ void DeviceMemoryAllocator::resetPeakStats() {
 
   stats_.oversize_allocations.reset_peak();
   stats_.oversize_segments.reset_peak();
+}
+
+void DeviceMemoryAllocator::processDeferredBlocksNoLock() {
+  c10::DeviceGuard device_guard{
+      c10::Device(c10::DeviceType::PrivateUse1, device_index_)};
+
+  for (auto it = deferred_pointers_.begin(); it != deferred_pointers_.end();) {
+    void* ptr = *it;
+    auto block_it = blocks_.find(ptr);
+    TORCH_INTERNAL_ASSERT(
+        block_it != blocks_.end(),
+        "OpenReg allocator missing metadata for deferred pointer ",
+        ptr);
+    auto& block = block_it->second;
+    TORCH_INTERNAL_ASSERT(
+        block.state == BlockState::Deferred,
+        "Deferred pointer has unexpected state");
+
+    bool all_ready = true;
+    for (orEvent_t ev : block.events) {
+      const auto err = orEventQuery(ev);
+      if (err == orSuccess) {
+        continue;
+      }
+      if (err == orErrorNotReady) {
+        all_ready = false;
+        break;
+      }
+      TORCH_CHECK(
+          false,
+          "orEventQuery failed for OpenReg deferred-free event with error code ",
+          err);
+    }
+
+    if (!all_ready) {
+      ++it;
+      continue;
+    }
+
+    for (orEvent_t ev : block.events) {
+      OPENREG_CHECK(orEventDestroy(ev));
+    }
+    block.events.clear();
+
+    moveBlockToCacheNoLock(ptr, block);
+    it = deferred_pointers_.erase(it);
+  }
+}
+
+void DeviceMemoryAllocator::moveBlockToCacheNoLock(void* ptr, BlockInfo& block) {
+  TORCH_INTERNAL_ASSERT(
+      block.state == BlockState::Allocated || block.state == BlockState::Deferred);
+  block.state = BlockState::Cached;
+  cached_blocks_by_stream_[block.alloc_stream].emplace(block.size_bytes, ptr);
 }
 
 namespace {
@@ -339,15 +556,34 @@ void OpenRegDeviceAllocator::emptyCache(MempoolId_t mempool_id) {
 void OpenRegDeviceAllocator::recordStream(
     const DataPtr& ptr,
     c10::Stream stream) {
-  // PR2-level plumbing: this counter is used by tests to ensure the PrivateUse1
+  if (!ptr.get()) {
+    return;
+  }
+  if (stream.device_type() != c10::DeviceType::PrivateUse1) {
+    // Best-effort: ignore streams that aren't owned by the OpenReg backend.
+    return;
+  }
+  if (ptr.get_deleter() != &deleteOpenRegMemory) {
+    // Ignore pointers not owned by the OpenReg allocator.
+    return;
+  }
+
+  c10::DeviceIndex device_index = -1;
+  {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto it = allocated_blocks_.find(ptr.get());
+    if (it == allocated_blocks_.end()) {
+      // Best-effort: ignore unknown pointers.
+      return;
+    }
+    device_index = it->second;
+  }
+
+  // Test-only plumbing counter: this is used by tests to ensure the PrivateUse1
   // guard hook forwards recordDataPtrOnStream() to the allocator's recordStream().
-  // Stream-aware lifetime semantics are implemented in a follow-up PR.
-  (void)ptr;
-  (void)stream;
   testBumpRecordStreamCallCount();
 
-  // OpenReg doesn't track stream usage yet
-  // TODO: When stream support is added, track which streams are using this pointer
+  device_allocators_[device_index]->recordStream(ptr.get(), stream);
 }
 // ============ Global Registration ============
 
